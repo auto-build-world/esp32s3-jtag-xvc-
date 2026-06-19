@@ -1,0 +1,35 @@
+*.elf
+
+*credentials*
+!main/credentials.h.example
+
+# ESP-IDF build artifacts
+build/
+build/*.bin
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# Project-specific
+backup_*/
+tools/__pycache__/
+tools/myenv/
+tools/dist/
+
+# IDE / config
+.omo/
+.vscode/
+
+# Arduino reference (keep main/ only)
+xvc-esp32/
+sketch.json
+arduino-cli.yaml
+
+# Image/media files
+*.jpg
+*.png
+*.webp
+*.pdf
+
+AGENTS.md
+README-Original.md
