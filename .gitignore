@@ -19,6 +19,7 @@ tools/dist/
 # IDE / config
 .omo/
 .vscode/
+.venv/
 
 # Arduino reference (keep main/ only)
 xvc-esp32/

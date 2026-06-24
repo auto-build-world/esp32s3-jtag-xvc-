@@ -72,7 +72,7 @@ static constexpr const int tdo_gpio = 9;
 static constexpr const int tdi_gpio = 8;
 
 // Transition delay coefficients
-static unsigned int jtag_delay = 100;
+static unsigned int jtag_delay = 20;  // default ~3.5 MHz TCK; set higher for reliability
 
 static constexpr const char* TAG = "XVC";
 
@@ -80,8 +80,8 @@ static constexpr const char* TAG = "XVC";
 // JTAG primitives
 // ---------------------------------------------------------------------------
 
-static void jtag_write(std::uint_fast8_t tck, std::uint_fast8_t tms,
-                        std::uint_fast8_t tdi)
+static inline void jtag_write(std::uint_fast8_t tck, std::uint_fast8_t tms,
+                               std::uint_fast8_t tdi)
 {
   gpio_set_level(static_cast<gpio_num_t>(tck_gpio), tck);
   gpio_set_level(static_cast<gpio_num_t>(tms_gpio), tms);
@@ -91,7 +91,7 @@ static void jtag_write(std::uint_fast8_t tck, std::uint_fast8_t tms,
     asm volatile ("nop");
 }
 
-static bool jtag_read(void)
+static inline bool jtag_read(void)
 {
   return gpio_get_level(static_cast<gpio_num_t>(tdo_gpio)) & 1;
 }
@@ -509,6 +509,18 @@ static void jtag_bridge_task(void*)
 
     switch (cmd) {
     case 'I':
+      // Aggressively drain stale bootloader bytes from USB RX buffer.
+      // Non-blocking flush (timeout=0) can miss bytes that arrive
+      // after the flush starts. Use multiple passes with a delay
+      // to catch stragglers.
+      {
+        std::uint8_t flush_buf[64];
+        for (int pass = 0; pass < 3; pass++) {
+          while (usb_serial_jtag_read_bytes(flush_buf, sizeof(flush_buf), 0) > 0)
+            /* drain */;
+          if (pass < 2) vTaskDelay(pdMS_TO_TICKS(20));
+        }
+      }
       jtag_init();
       // Send ACK so proxy knows we're ready and any stale boot data is flushed
       {
@@ -516,6 +528,30 @@ static void jtag_bridge_task(void*)
         usb_write_all(&ack, 1, pdMS_TO_TICKS(100));
       }
       break;
+
+    case 0x55: {  // 'U' — diagnostic echo command (no JTAG)
+      std::uint16_t payload_len;
+      if (usb_read_exact(reinterpret_cast<std::uint8_t*>(&payload_len),
+                         2, pdMS_TO_TICKS(500)) != 0)
+        break;
+      if (payload_len > 4096) break;
+      std::uint8_t* echo_buf = new (std::nothrow) std::uint8_t[payload_len + 4];
+      if (!echo_buf) break;
+      if (payload_len > 0) {
+        if (usb_read_exact(echo_buf, payload_len, pdMS_TO_TICKS(5000)) != 0) {
+          delete[] echo_buf;
+          break;
+        }
+      }
+      std::uint8_t prefix[2];
+      prefix[0] = static_cast<std::uint8_t>(payload_len & 0xff);
+      prefix[1] = static_cast<std::uint8_t>((payload_len >> 8) & 0xff);
+      usb_write_all(prefix, 2, pdMS_TO_TICKS(1000));
+      if (payload_len > 0)
+        usb_write_all(echo_buf, payload_len, pdMS_TO_TICKS(3000));
+      delete[] echo_buf;
+      break;
+    }
 
     case 'S': {
       // Read bit count (uint16_t, little-endian)
@@ -531,9 +567,13 @@ static void jtag_bridge_task(void*)
       // Use heap allocation to avoid large stack array
       std::uint8_t* buf = new (std::nothrow) std::uint8_t[nr_bytes * 2 + 4];
       if (!buf) break;
-      // Large shifts (thousands of bytes) need longer USB read timeout
-      int read_timeout = (nr_bytes > 256) ? 2000 : 500;
-      if (usb_read_exact(buf, nr_bytes * 2, pdMS_TO_TICKS(read_timeout)) != 0) {
+      // Large shifts (thousands of bytes) need longer USB read timeout.
+      // Aggressive timeout = silent data loss → corrupted bitstream → DONE low.
+      // Use generous timeout to guarantee completion.
+      TickType_t read_timeout =  (nr_bytes > 1024) ? pdMS_TO_TICKS(10000)
+                               : (nr_bytes > 256)  ? pdMS_TO_TICKS(5000)
+                               :                     pdMS_TO_TICKS(1000);
+      if (usb_read_exact(buf, nr_bytes * 2, read_timeout) != 0) {
         delete[] buf;
         break;
       }
@@ -588,10 +628,50 @@ static void jtag_bridge_task(void*)
 static void serialTask(void*)
 {
   std::uint8_t data;
+  char cmd_buf[128];
+  int cmd_pos = 0;
+  TickType_t last_tick = 0;
+
   while (true) {
+    bool got0 = false;
     if (uart_read_bytes(UART_NUM_0, &data, 1, pdMS_TO_TICKS(10)) > 0) {
+      got0 = true;
+      // Forward to FPGA UART (original bridge behavior)
       uart_write_bytes(UART_NUM_1, (const char*)&data, 1);
+
+      // Build wifi command buffer for commands typed on CH340
+      char ch = static_cast<char>(data);
+      last_tick = xTaskGetTickCount();
+
+      if (cmd_pos == 0 && ch == 'w') {
+        cmd_buf[cmd_pos++] = ch;
+      } else if (cmd_pos > 0) {
+        if (ch == '\n' || ch == '\r') {
+          cmd_buf[cmd_pos] = '\0';
+          cmd_pos = 0;
+          if (strncmp(cmd_buf, "wifi ", 5) == 0) {
+            handle_cmd_line(cmd_buf);
+            // handle_cmd_line writes response via console_printf (USB Serial/JTAG).
+            // Also echo result to CH340 so make monitor users see it.
+            uart_write_bytes(UART_NUM_0,
+              (const uint8_t*)"\r\n", 2);
+          }
+        } else if (cmd_pos < (int)sizeof(cmd_buf) - 1) {
+          cmd_buf[cmd_pos++] = ch;
+        }
+      }
     }
+
+    // Idle 2 seconds — auto-process accumulated wifi command
+    if (cmd_pos > 0 && !got0
+        && (xTaskGetTickCount() - last_tick) > pdMS_TO_TICKS(2000)) {
+      cmd_buf[cmd_pos] = '\0';
+      cmd_pos = 0;
+      if (strncmp(cmd_buf, "wifi ", 5) == 0)
+        handle_cmd_line(cmd_buf);
+    }
+
+    // UART_NUM_1 → UART_NUM_0 (FPGA UART → PC, unchanged)
     if (uart_read_bytes(UART_NUM_1, &data, 1, 0) > 0) {
       uart_write_bytes(UART_NUM_0, (const char*)&data, 1);
     }
@@ -650,7 +730,10 @@ static void console_printf(const char* fmt, ...)
     int len = (n < maxlen) ? n : maxlen;
     buf[len] = '\r';
     buf[len + 1] = '\n';
+    // Write to USB Serial/JTAG (native USB — used by watchdog in WiFi mode)
     usb_serial_jtag_write_bytes(buf, len + 2, pdMS_TO_TICKS(100));
+    // Also write to CH340 UART so make monitor users see responses
+    uart_write_bytes(UART_NUM_0, buf, len + 2);
   }
 }
 
@@ -876,6 +959,18 @@ extern "C" void app_main()
     .rx_buffer_size = 2048,
   };
   ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_serial_jtag_cfg));
+
+  // Drain stale bootloader bytes from USB Serial/JTAG RX buffer.
+  // A single non-blocking pass can miss bytes that arrive after the
+  // USB driver install completes. Use multiple passes with delay.
+  {
+    std::uint8_t flush_buf[64];
+    for (int pass = 0; pass < 3; pass++) {
+      while (usb_serial_jtag_read_bytes(flush_buf, sizeof(flush_buf), 0) > 0)
+        /* drain */;
+      if (pass < 2) vTaskDelay(pdMS_TO_TICKS(20));
+    }
+  }
 
   // Start WiFi in background (non-blocking)
   wifi_init_sta();
