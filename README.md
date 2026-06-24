@@ -137,17 +137,23 @@ make flash
 
 # 3. 在 PC 上运行代理（需要 Python 3 + pyserial）
 pip install pyserial
-python tools/xvc-proxy.py            # 交互式选择端口
-python tools/xvc-proxy.py --port COM3  # 或直接指定端口
+python tools/xvc-proxy.py                        # 交互式选择端口
+python tools/xvc-proxy.py --port COM3             # 直接指定端口
+python tools/xvc-proxy.py --debug                 # 启用详细日志
+python tools/xvc-proxy.py --diagnose              # USB 数据路径诊断（无需 Vivado）
 
 # 4. 在 Vivado 中：Hardware Manager → Add Virtual Cable → localhost:2542
 ```
 
-也可直接使用 Windows 可执行文件（无需 Python）：
+也可直接使用 Windows 可执行文件（无需 Python，已预装 `pyserial`）：
 
 ```bash
 tools/xvc-proxy.exe --port COM3
+tools/xvc-proxy.exe --debug
+tools/xvc-proxy.exe --diagnose
 ```
+
+> **提示**：如果首次编程失败，先运行 `--diagnose` 验证 USB 数据路径。诊断测试会清空 ESP32 引导加载程序残留的 USB 数据，一次性解决同步问题。
 
 ### USB 桥接二进制协议
 
@@ -160,16 +166,17 @@ ESP32 → PC: len_prefix(u16 LE) + TDO[n/8 字节]
 
 ---
 
-## 运行时 WiFi 命令（串口控制）
+## 运行时 WiFi 命令
 
-通过 USB 串口（UART，115200 baud）发送以下命令：
+通过 **CH340 串口**（`make monitor` 所使用的端口，115200 baud）发送以下命令。
+**在 WiFi 模式和桥接模式下均可用。**
 
 | 命令 | 作用 |
 |------|------|
 | `wifi set <SSID> <PASS>` | 保存 WiFi 凭证到 NVS 并重新连接 |
 | `wifi show` | 显示当前 WiFi SSID 和 NVS 状态 |
 | `wifi reset` | 擦除 NVS 中保存的凭证，回退到 `credentials.h` |
-| `wifi delay <1-1000>` | 设置 JTAG 延迟值（持久化到 NVS，默认 100） |
+| `wifi delay <1-1000>` | 设置 JTAG 延迟值（持久化到 NVS，默认 20） |
 | `wifi speed` | 打印基于当前延迟的近似 TCK 频率 |
 
 ### 凭证优先级
@@ -183,10 +190,19 @@ ESP32 → PC: len_prefix(u16 LE) + TDO[n/8 字节]
 
 ## JTAG 时序调整
 
-默认 JTAG 延迟值为 `100`，可通过以下方式调整：
+默认 JTAG 延迟值为 `20`（TCK 约 3.5 MHz），可通过以下方式调整：
 
 - 运行时：`wifi delay <1-1000>`（实时生效，持久化到 NVS）
-- 编译时：修改 `main/main.cpp` 中的 `static unsigned int jtag_delay = 100;`
+- 编译时：修改 `main/main.cpp` 中的 `static unsigned int jtag_delay = 20;`
+
+延迟值与 TCK 频率对照：
+
+| `jtag_delay` | 约 TCK | 适用场景 |
+|:---:|:---:|---|
+| 20 | 3.5 MHz | 短接线、同一 PCB（默认） |
+| 50 | 2.0 MHz | 杜邦线、普通环境 |
+| 100 | 1.0 MHz | 线缆较长或不确定稳定性 |
+| 200 | 0.6 MHz | 线缆很长或干扰较大 |
 
 对于较长的线缆或不稳定的环境，适当增大延迟值可以提高稳定性。降低延迟值可以获得更高的 TCK 频率。
 
@@ -200,7 +216,9 @@ ESP32 → PC: len_prefix(u16 LE) + TDO[n/8 字节]
 
 ## UART 串口桥接
 
-固件包含一个双向 UART 桥接任务，将 `UART_NUM_0`（USB UART，115200 baud）与 `UART_NUM_1`（RX=33, TX=23, 115200 baud）连接，在 `APP_CPU_NUM` 核心上运行。这提供了 FPGA UART 的透传功能，同时也在该串口上处理 `wifi` 命令。
+固件包含一个双向 UART 桥接任务，将 `UART_NUM_0`（CH340 USB UART，115200 baud）与 `UART_NUM_1`（RX=33, TX=23, 115200 baud）连接，在 `APP_CPU_NUM` 核心上运行。这提供了 FPGA UART 的透传功能。
+
+该任务也会从 CH340 串口数据流中检测 `wifi` 命令并在**两种模式**下处理。响应会同时输出到 CH340 和原生 USB 端口。
 
 ---
 
@@ -208,13 +226,14 @@ ESP32 → PC: len_prefix(u16 LE) + TDO[n/8 字节]
 
 | 文件 | 说明 |
 |------|------|
-| `main/main.cpp` | 固件源码（~940 行，C++17，ESP-IDF） |
+| `main/main.cpp` | 固件源码（~990 行，C++17，ESP-IDF） |
 | `main/credentials.h.example` | WiFi 配置模板（重命名为 `credentials.h` 并编辑） |
 | `main/CMakeLists.txt` | 组件构建配置 |
 | `firmware/xvc-esp32.bin` | 预编译固件（ESP32-S3） |
 | `tools/xvc-proxy.py` | USB 桥接模式 PC 端代理（Python） |
 | `tools/xvc-proxy.exe` | USB 桥接模式 PC 端代理（Windows 可执行文件） |
 | `tools/xvc-proxy.spec` | PyInstaller 打包配置 |
+| `--diagnose` 参数 | 运行 USB 数据路径回环测试，验证数据完整性并清空残留字节 |
 | `tools/test_xvc_server.py` | XVC 服务器测试脚本 |
 | `tools/fix11.py` | 辅助工具脚本 |
 | `board_detect.py` | 串口自动检测 |
@@ -247,7 +266,9 @@ idf.py build   # 先生成编译数据库
 
 ### Vivado 报错 "End of startup status: LOW"
 
-检查 FPGA 电源的电压和电流是否满足要求。
+**桥接模式**：ESP32 ROM 引导加载程序向 USB Serial/JTAG 输出的残留字节可能干扰桥接协议。运行 `--diagnose` 可自动清空残留数据并恢复正常通信。也可重启 ESP32 后重试。
+
+**WiFi 模式**：检查 FPGA 电源的电压和电流是否满足要求。
 
 ### 烧录时检测不到端口
 
